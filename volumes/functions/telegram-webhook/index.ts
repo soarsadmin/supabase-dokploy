@@ -89,6 +89,7 @@ export default {
         return Response.json({ ok: true, cancelled: true });
       }
 
+      const today = getTodayInHongKong();
       const existingDraft = await findPendingDraft(chatId, userId);
       const recentTasks = await fetchTasksForChat(chatId, 10);
       const command = await analyzeUserCommandWithAi({
@@ -96,7 +97,7 @@ export default {
         userId,
         existingDraft: existingDraft?.draft_payload ?? null,
         recentTasks,
-        today: getTodayInHongKong(),
+        today,
       });
 
       if (command.action === "list") {
@@ -120,8 +121,9 @@ export default {
         text,
         userId,
         existingDraft: existingDraft?.draft_payload ?? null,
-        today: getTodayInHongKong(),
+        today,
       });
+      applyRelativeWeekdayOverrideToAnalysis(analysis, text, today);
 
       if (!analysis.is_task) {
         await sendTelegramMessage(chatId, "收到。不過我暫時判斷這不是一個任務，所以未有寫入。");
@@ -430,9 +432,12 @@ function findTaskToUpdate(recentTasks: TaskRow[], request: AiTaskUpdateRequest) 
 }
 
 function buildCommandSystemPrompt(today: string) {
+  const dateReference = buildDateReference(today);
+
   return `
 You are the command router for a Telegram project-management bot.
 Today is ${today}.
+${dateReference}
 
 Decide whether the latest message wants to create a task, list tasks, update a task, or is unrelated.
 Use recent_tasks to resolve natural references like "第二個", "pricing page", "deadline", "今日未完成".
@@ -441,6 +446,7 @@ Use existing_draft only when the user is answering a follow-up question for a ne
 Important rules:
 - Output JSON only. No Markdown.
 - Convert relative dates to YYYY-MM-DD using today.
+- Do not calculate weekdays yourself. Use the provided date reference for phrases like 今個星期五, 這個星期五, 下星期一, 下週三.
 - Never invent a task id. For update, use target_task_number from recent_tasks when possible.
 - If update target is ambiguous, set action="update", leave target fields null, and set clarification_question.
 - For list, translate the user's conditions into status, due_date, priority, search_text, open_only, include_pending, and limit.
@@ -503,12 +509,13 @@ function normalizeCommand(raw: Record<string, unknown>, input: {
   text: string;
   userId: number;
   existingDraft: TaskDraft | null;
+  today: string;
 }): AiCommand {
   const action = raw.action === "list" || raw.action === "update" || raw.action === "other"
     ? raw.action
     : "create";
 
-  return {
+  const command: AiCommand = {
     action,
     reply: stringOrNull(raw.reply),
     list: normalizeListRequest(raw.list),
@@ -521,6 +528,9 @@ function normalizeCommand(raw: Record<string, unknown>, input: {
       })
       : null,
   };
+
+  applyRelativeWeekdayOverrideToCommand(command, input.text, input.today);
+  return command;
 }
 
 function normalizeListRequest(value: unknown): AiTaskListRequest | null {
@@ -668,9 +678,12 @@ async function callOllamaJson(messages: Array<{ role: "system" | "user"; content
 }
 
 function buildSystemPrompt(today: string) {
+  const dateReference = buildDateReference(today);
+
   return `
 You are a project-management intake assistant for a small company.
 Today is ${today}.
+${dateReference}
 
 Your job:
 1. Decide whether the user's message is a task/request.
@@ -690,6 +703,7 @@ Optional fields:
 Rules:
 - Output JSON only. No Markdown.
 - If date is relative, convert it to YYYY-MM-DD using today.
+- Do not calculate weekdays yourself. Use the provided date reference for phrases like 今個星期五, 這個星期五, 下星期一, 下週三.
 - If owner is unclear, use telegram_user_id as owner_telegram_user_id.
 - Keep Cantonese/Traditional Chinese wording in title, description, and question.
 - missing_fields must contain field names only.
@@ -715,6 +729,116 @@ Return this exact JSON shape:
 function getTodayInHongKong() {
   const hongKongOffsetMs = 8 * 60 * 60 * 1000;
   return new Date(Date.now() + hongKongOffsetMs).toISOString().slice(0, 10);
+}
+
+function buildDateReference(today: string) {
+  const currentWeek = buildWeekReference(today, 0);
+  const nextWeek = buildWeekReference(today, 1);
+
+  return [
+    "Date reference. Use these dates exactly:",
+    `- Current week: ${currentWeek}`,
+    `- Next week: ${nextWeek}`,
+  ].join("\n");
+}
+
+function buildWeekReference(today: string, weekOffset: number) {
+  const labels = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"];
+
+  return labels
+    .map((label, index) => `${label}=${getDateForWeekday(today, weekOffset, index)}`)
+    .join(", ");
+}
+
+function applyRelativeWeekdayOverrideToCommand(command: AiCommand, text: string, today: string) {
+  const dueDate = inferRelativeWeekdayDate(text, today);
+
+  if (!dueDate) {
+    return;
+  }
+
+  if (command.action === "list" && command.list) {
+    command.list.due_date = dueDate;
+  }
+
+  if (command.action === "update" && command.update) {
+    command.update.fields.due_date = dueDate;
+  }
+
+  if (command.action === "create" && command.create) {
+    applyDueDateToAnalysis(command.create, dueDate);
+  }
+}
+
+function applyRelativeWeekdayOverrideToAnalysis(analysis: AiAnalysis, text: string, today: string) {
+  const dueDate = inferRelativeWeekdayDate(text, today);
+
+  if (dueDate) {
+    applyDueDateToAnalysis(analysis, dueDate);
+  }
+}
+
+function applyDueDateToAnalysis(analysis: AiAnalysis, dueDate: string) {
+  analysis.task.due_date = dueDate;
+  analysis.missing_fields = analysis.missing_fields.filter((field) => field !== "due_date");
+  analysis.ready_to_save = analysis.missing_fields.length === 0 && Boolean(analysis.task.title);
+}
+
+function inferRelativeWeekdayDate(text: string, today: string) {
+  const currentWeekMatch = text.match(
+    /(?:今個星期|今星期|這個星期|呢個星期|本星期|今週|本週|今周|本周)\s*(?:星期|週|周|禮拜)?\s*([一二三四五六日天1234567])/,
+  );
+
+  if (currentWeekMatch) {
+    return getDateForWeekday(today, 0, weekdayTextToIndex(currentWeekMatch[1]));
+  }
+
+  const nextWeekMatch = text.match(
+    /(?:下個星期|下星期|下週|下周)\s*(?:星期|週|周|禮拜)?\s*([一二三四五六日天1234567])/,
+  );
+
+  if (nextWeekMatch) {
+    return getDateForWeekday(today, 1, weekdayTextToIndex(nextWeekMatch[1]));
+  }
+
+  return null;
+}
+
+function weekdayTextToIndex(value: string) {
+  const weekdayMap: Record<string, number> = {
+    "1": 0,
+    一: 0,
+    "2": 1,
+    二: 1,
+    "3": 2,
+    三: 2,
+    "4": 3,
+    四: 3,
+    "5": 4,
+    五: 4,
+    "6": 5,
+    六: 5,
+    "7": 6,
+    日: 6,
+    天: 6,
+  };
+
+  return weekdayMap[value] ?? 0;
+}
+
+function getDateForWeekday(today: string, weekOffset: number, weekdayIndex: number) {
+  const todayDate = new Date(`${today}T00:00:00.000Z`);
+  const todayWeekdayIndex = (todayDate.getUTCDay() + 6) % 7;
+  const mondayDate = addDays(todayDate, -todayWeekdayIndex);
+  const targetDate = addDays(mondayDate, weekOffset * 7 + weekdayIndex);
+
+  return targetDate.toISOString().slice(0, 10);
+}
+
+function addDays(date: Date, days: number) {
+  const result = new Date(date);
+  result.setUTCDate(result.getUTCDate() + days);
+  return result;
 }
 
 function parseJsonObject(content: unknown): Record<string, unknown> {
