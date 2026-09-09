@@ -1,14 +1,13 @@
 volumes/db/data
 volumes/storage
 volumes/snippets
-volumes/functions/**
-!volumes/functions/deno.json*
-!volumes/functions/main/
-volumes/functions/main/**
-!volumes/functions/main/index.ts
-!volumes/functions/hello/
-volumes/functions/hello/**
-!volumes/functions/hello/index.ts
+# Keep Edge Functions source code in Git
+!volumes/functions/
+!volumes/functions/**
+# Ignore local/generated function clutter
+volumes/functions/.tmp/
+volumes/functions/.cache/
+volumes/functions/**/.DS_Store
 .env
 test.http
 docker-compose.override.yml
