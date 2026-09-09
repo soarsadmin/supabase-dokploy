@@ -70,7 +70,7 @@ async function sendTelegramMessage(chatId: number, text: string) {
     return;
   }
 
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -78,6 +78,11 @@ async function sendTelegramMessage(chatId: number, text: string) {
       text,
     }),
   });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`Telegram sendMessage failed: ${response.status} ${errorBody}`);
+  }
 }
 
 async function analyzeTask(text: string) {
