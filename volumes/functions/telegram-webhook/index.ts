@@ -29,6 +29,8 @@ type TaskUpdateFields = Partial<Pick<TaskDraft, "title" | "due_date" | "status" 
 type AiTaskListRequest = {
   status: TaskStatus | null;
   due_date: string | null;
+  due_date_from: string | null;
+  due_date_to: string | null;
   priority: Priority | null;
   search_text: string | null;
   open_only: boolean;
@@ -355,6 +357,14 @@ async function buildTasksReplyFromAi(chatId: number, userId: number, request: Ai
     query = query.eq("due_date", listRequest.due_date);
   }
 
+  if (listRequest.due_date_from) {
+    query = query.gte("due_date", listRequest.due_date_from);
+  }
+
+  if (listRequest.due_date_to) {
+    query = query.lte("due_date", listRequest.due_date_to);
+  }
+
   if (listRequest.search_text) {
     query = query.ilike("title", `%${escapeLikePattern(listRequest.search_text)}%`);
   }
@@ -374,9 +384,21 @@ async function buildTasksReplyFromAi(chatId: number, userId: number, request: Ai
   }
 
   return [
-    "符合條件的任務：",
+    `${buildListReplyTitle(listRequest)}：`,
     ...tasks.map((task, index) => formatTaskLine(task, index + 1)),
   ].join("\n");
+}
+
+function buildListReplyTitle(listRequest: AiTaskListRequest) {
+  if (listRequest.due_date) {
+    return `${listRequest.due_date} 的任務`;
+  }
+
+  if (listRequest.due_date_from && listRequest.due_date_to) {
+    return `${listRequest.due_date_from} 至 ${listRequest.due_date_to} 的任務`;
+  }
+
+  return "符合條件的任務";
 }
 
 async function updateTaskFromAiCommand(
@@ -449,7 +471,9 @@ Important rules:
 - Do not calculate weekdays yourself. Use the provided date reference for phrases like 今個星期五, 這個星期五, 下星期一, 下週三.
 - Never invent a task id. For update, use target_task_number from recent_tasks when possible.
 - If update target is ambiguous, set action="update", leave target fields null, and set clarification_question.
-- For list, translate the user's conditions into status, due_date, priority, search_text, open_only, include_pending, and limit.
+- For list, translate the user's conditions into status, due_date, due_date_from, due_date_to, priority, search_text, open_only, include_pending, and limit.
+- If the user asks for this/current week tasks, set due_date_from and due_date_to to the Current week Monday-Sunday dates from the date reference.
+- If the user asks for next week tasks, set due_date_from and due_date_to to the Next week Monday-Sunday dates from the date reference.
 - If the user asks for open/unfinished/未完成 tasks, use open_only=true instead of status="todo".
 - If the user asks for drafts, pending tasks, unfinished draft, or messages waiting for clarification, set include_pending=true.
 - For create, return the same create object used by the task intake flow.
@@ -457,6 +481,8 @@ Important rules:
 
 Examples:
 - "今日有咩未完成？" => action=list, due_date=today, open_only=true.
+- "列出今個星期任務" => action=list, due_date_from=current week Monday, due_date_to=current week Sunday.
+- "下星期有咩未完成？" => action=list, due_date_from=next week Monday, due_date_to=next week Sunday, open_only=true.
 - "列出 pricing 相關任務" => action=list, search_text="pricing".
 - "把 pricing page 改到星期五" => action=update, choose the matching recent_tasks number, fields.due_date=that Friday.
 - "第二個做完" => action=update, target_task_number=2, fields.status="done".
@@ -469,6 +495,8 @@ Return this exact JSON shape:
   "list": {
     "status": null,
     "due_date": null,
+    "due_date_from": null,
+    "due_date_to": null,
     "priority": null,
     "search_text": null,
     "open_only": false,
@@ -541,6 +569,8 @@ function normalizeListRequest(value: unknown): AiTaskListRequest | null {
   return {
     status: statusOrNull(value.status),
     due_date: dateOrNull(value.due_date),
+    due_date_from: dateOrNull(value.due_date_from),
+    due_date_to: dateOrNull(value.due_date_to),
     priority: priorityOrNull(value.priority),
     search_text: stringOrNull(value.search_text),
     open_only: value.open_only === true,
@@ -597,6 +627,8 @@ function defaultListRequest(): AiTaskListRequest {
   return {
     status: null,
     due_date: null,
+    due_date_from: null,
+    due_date_to: null,
     priority: null,
     search_text: null,
     open_only: false,
@@ -752,20 +784,25 @@ function buildWeekReference(today: string, weekOffset: number) {
 
 function applyRelativeWeekdayOverrideToCommand(command: AiCommand, text: string, today: string) {
   const dueDate = inferRelativeWeekdayDate(text, today);
+  const dueDateRange = inferRelativeWeekRange(text, today);
 
-  if (!dueDate) {
-    return;
-  }
-
-  if (command.action === "list" && command.list) {
+  if (dueDate && command.action === "list" && command.list) {
     command.list.due_date = dueDate;
+    command.list.due_date_from = null;
+    command.list.due_date_to = null;
   }
 
-  if (command.action === "update" && command.update) {
+  if (dueDateRange && command.action === "list" && command.list) {
+    command.list.due_date = null;
+    command.list.due_date_from = dueDateRange.from;
+    command.list.due_date_to = dueDateRange.to;
+  }
+
+  if (dueDate && command.action === "update" && command.update) {
     command.update.fields.due_date = dueDate;
   }
 
-  if (command.action === "create" && command.create) {
+  if (dueDate && command.action === "create" && command.create) {
     applyDueDateToAnalysis(command.create, dueDate);
   }
 }
@@ -799,6 +836,31 @@ function inferRelativeWeekdayDate(text: string, today: string) {
 
   if (nextWeekMatch) {
     return getDateForWeekday(today, 1, weekdayTextToIndex(nextWeekMatch[1]));
+  }
+
+  return null;
+}
+
+function inferRelativeWeekRange(text: string, today: string) {
+  const hasSpecificWeekday =
+    /(?:今個星期|今星期|這個星期|呢個星期|本星期|今週|本週|今周|本周|下個星期|下星期|下週|下周)\s*(?:星期|週|周|禮拜)?\s*[一二三四五六日天1234567]/.test(text);
+
+  if (hasSpecificWeekday) {
+    return null;
+  }
+
+  if (/(?:今個星期|今星期|這個星期|呢個星期|本星期|今週|本週|今周|本周)/.test(text)) {
+    return {
+      from: getDateForWeekday(today, 0, 0),
+      to: getDateForWeekday(today, 0, 6),
+    };
+  }
+
+  if (/(?:下個星期|下星期|下週|下周)/.test(text)) {
+    return {
+      from: getDateForWeekday(today, 1, 0),
+      to: getDateForWeekday(today, 1, 6),
+    };
   }
 
   return null;
