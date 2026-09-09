@@ -436,6 +436,8 @@ services:
     container_name: supabase-edge-functions
     image: supabase/edge-runtime:v1.74.0
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./volumes/functions:/home/deno/functions:z
       - deno-cache:/root/.cache/deno
@@ -464,6 +466,9 @@ services:
       SUPABASE_SECRET_KEYS: "{\"default\":\"${SUPABASE_SECRET_KEY:-}\"}"
       SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
       # TODO: Allow configuring VERIFY_JWT per function.
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:
