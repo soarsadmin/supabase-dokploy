@@ -1,53 +1,74 @@
+import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-const supabase = createClient(
-  Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("SERVICE_ROLE_KEY")!
-);
+const supabaseUrl = Deno.env.get("SUPABASE_URL");
+const supabaseServiceRoleKey =
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? Deno.env.get("SERVICE_ROLE_KEY");
 
-Deno.serve(async (req) => {
-  const update = await req.json();
+if (!supabaseUrl || !supabaseServiceRoleKey) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
 
-  const message = update.message;
-  const text = message?.text;
-  const chatId = message?.chat?.id;
-  const userId = message?.from?.id;
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 
-  if (!text || !chatId || !userId) {
-    return Response.json({ ok: true });
-  }
+export default {
+  async fetch(req: Request) {
+    const update = await req.json();
 
-  const analysis = await analyzeTask(text);
+    const message = update.message;
+    const text = message?.text;
+    const chatId = message?.chat?.id;
+    const userId = message?.from?.id;
 
-  if (!analysis.ready_to_save) {
-    await supabase.from("pending_task_drafts").insert({
-      telegram_chat_id: chatId,
-      telegram_user_id: userId,
+    if (!text || !chatId || !userId) {
+      return Response.json({ ok: true, ignored: true });
+    }
+
+    const analysis = await analyzeTask(text);
+
+    if (!analysis.ready_to_save) {
+      const { error } = await supabase.from("pending_task_drafts").insert({
+        telegram_chat_id: chatId,
+        telegram_user_id: userId,
+        source_message_id: message.message_id,
+        draft_payload: analysis.task,
+        missing_fields: analysis.missing_fields,
+      });
+
+      if (error) {
+        return Response.json({ ok: false, error: error.message }, { status: 500 });
+      }
+
+      await sendTelegramMessage(chatId, analysis.question ?? "請補充資料。");
+      return Response.json({ ok: true, saved_to: "pending_task_drafts" });
+    }
+
+    const { error } = await supabase.from("tasks").insert({
+      title: analysis.task.title,
+      description: analysis.task.description,
+      status: analysis.task.status,
+      owner_telegram_user_id: analysis.task.owner_telegram_user_id,
+      due_date: analysis.task.due_date,
+      source_chat_id: chatId,
       source_message_id: message.message_id,
-      draft_payload: analysis.task,
-      missing_fields: analysis.missing_fields,
     });
 
-    await sendTelegramMessage(chatId, analysis.question ?? "請補充資料。");
-    return Response.json({ ok: true });
-  }
+    if (error) {
+      return Response.json({ ok: false, error: error.message }, { status: 500 });
+    }
 
-  await supabase.from("tasks").insert({
-    title: analysis.task.title,
-    description: analysis.task.description,
-    status: analysis.task.status,
-    owner_telegram_user_id: analysis.task.owner_telegram_user_id,
-    due_date: analysis.task.due_date,
-    source_chat_id: chatId,
-    source_message_id: message.message_id,
-  });
-
-  await sendTelegramMessage(chatId, `已建立任務：${analysis.task.title}`);
-  return Response.json({ ok: true });
-});
+    await sendTelegramMessage(chatId, `已建立任務：${analysis.task.title}`);
+    return Response.json({ ok: true, saved_to: "tasks" });
+  },
+};
 
 async function sendTelegramMessage(chatId: number, text: string) {
-  const token = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
+  const token = Deno.env.get("TELEGRAM_BOT_TOKEN");
+
+  if (!token) {
+    console.log("TELEGRAM_BOT_TOKEN is not set. Skipping Telegram reply.");
+    return;
+  }
 
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
