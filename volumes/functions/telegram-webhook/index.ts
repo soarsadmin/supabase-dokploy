@@ -19,6 +19,11 @@ type PendingTaskDraftRow = {
   missing_fields: string[];
 };
 
+type TaskRow = TaskDraft & {
+  id: string;
+  created_at: string;
+};
+
 type AiAnalysis = {
   is_task: boolean;
   ready_to_save: boolean;
@@ -55,6 +60,16 @@ export default {
         await deletePendingDraftsForUser(chatId, userId);
         await sendTelegramMessage(chatId, "已取消目前未完成的任務草稿。");
         return Response.json({ ok: true, cancelled: true });
+      }
+
+      const listRequest = detectListRequest(text);
+      if (listRequest) {
+        const reply = listRequest.target === "pending"
+          ? await buildPendingDraftsReply(chatId, userId)
+          : await buildTasksReply(chatId, listRequest.filter);
+
+        await sendTelegramMessage(chatId, reply);
+        return Response.json({ ok: true, listed: listRequest });
       }
 
       const existingDraft = await findPendingDraft(chatId, userId);
@@ -187,6 +202,117 @@ async function deletePendingDraftsForUser(chatId: number, userId: number) {
   if (error) {
     throw error;
   }
+}
+
+function detectListRequest(text: string):
+  | { target: "tasks"; filter: "all" | "today" | "open" }
+  | { target: "pending"; filter: "all" }
+  | null {
+  const normalizedText = text.toLowerCase();
+
+  if (
+    normalizedText === "/pending" ||
+    normalizedText.includes("pending") ||
+    text.includes("草稿") ||
+    text.includes("未完成草稿")
+  ) {
+    return { target: "pending", filter: "all" };
+  }
+
+  if (
+    normalizedText === "/tasks" ||
+    normalizedText === "/list" ||
+    text.includes("列出") ||
+    text.includes("顯示") ||
+    text.includes("睇下") ||
+    text.includes("有咩") ||
+    text.includes("有什麼")
+  ) {
+    if (text.includes("今日") || text.includes("今天")) {
+      return { target: "tasks", filter: "today" };
+    }
+
+    if (
+      text.includes("未完成") ||
+      text.includes("未做") ||
+      normalizedText.includes("open") ||
+      normalizedText.includes("todo")
+    ) {
+      return { target: "tasks", filter: "open" };
+    }
+
+    return { target: "tasks", filter: "all" };
+  }
+
+  return null;
+}
+
+async function buildTasksReply(chatId: number, filter: "all" | "today" | "open") {
+  let query = supabase
+    .from("tasks")
+    .select("id,title,description,status,priority,owner_telegram_user_id,due_date,created_at")
+    .eq("source_chat_id", chatId)
+    .order("due_date", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (filter === "today") {
+    query = query.eq("due_date", getTodayInHongKong());
+  }
+
+  if (filter === "open") {
+    query = query.neq("status", "done");
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    throw error;
+  }
+
+  const tasks = (data ?? []) as TaskRow[];
+  if (tasks.length === 0) {
+    return filter === "today" ? "今日未有任務。" : "暫時未有任務。";
+  }
+
+  const title = filter === "today"
+    ? "今日任務"
+    : filter === "open"
+      ? "未完成任務"
+      : "最近任務";
+
+  return [
+    `${title}：`,
+    ...tasks.map((task, index) => formatTaskLine(task, index + 1)),
+  ].join("\n");
+}
+
+async function buildPendingDraftsReply(chatId: number, userId: number) {
+  const { data, error } = await supabase
+    .from("pending_task_drafts")
+    .select("id,draft_payload,missing_fields")
+    .eq("telegram_chat_id", chatId)
+    .eq("telegram_user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (error) {
+    throw error;
+  }
+
+  const drafts = (data ?? []) as PendingTaskDraftRow[];
+  if (drafts.length === 0) {
+    return "暫時沒有未完成草稿。";
+  }
+
+  return [
+    "未完成草稿：",
+    ...drafts.map((draft, index) => {
+      const title = draft.draft_payload?.title ?? "未命名任務";
+      const missing = draft.missing_fields.length > 0 ? `，欠：${draft.missing_fields.join(", ")}` : "";
+      return `${index + 1}. ${title}${missing}`;
+    }),
+  ].join("\n");
 }
 
 async function analyzeTaskWithAi(input: {
@@ -370,6 +496,38 @@ async function sendTelegramMessage(chatId: number, text: string) {
 function buildTaskSavedMessage(task: TaskDraft) {
   const dueDate = task.due_date ? `\n期限：${task.due_date}` : "";
   return `已建立任務：${task.title}${dueDate}`;
+}
+
+function formatTaskLine(task: TaskRow, number: number) {
+  const dueDate = task.due_date ? `，期限：${task.due_date}` : "";
+  const priority = task.priority !== "medium" ? `，${formatPriority(task.priority)}` : "";
+  const status = formatStatus(task.status);
+
+  return `${number}. ${task.title}（${status}${dueDate}${priority}）`;
+}
+
+function formatStatus(status: TaskStatus) {
+  if (status === "done") {
+    return "已完成";
+  }
+
+  if (status === "in_progress") {
+    return "進行中";
+  }
+
+  return "待辦";
+}
+
+function formatPriority(priority: Priority) {
+  if (priority === "high") {
+    return "高優先";
+  }
+
+  if (priority === "low") {
+    return "低優先";
+  }
+
+  return "中優先";
 }
 
 function buildFallbackQuestion(missingFields: string[]) {
